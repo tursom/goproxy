@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/goproxy/goproxy"
 	"github.com/spf13/cobra"
+	"golang.org/x/net/proxy"
 )
 
 // newServerCmd creates a new server command.
@@ -54,6 +56,7 @@ type serverCmdConfig struct {
 	cacherDir        string
 	s3CacherOpts     s3CacherOptions
 	tempDir          string
+	proxy            string
 	insecure         bool
 	connectTimeout   time.Duration
 	fetchTimeout     time.Duration
@@ -84,6 +87,7 @@ func newServerCmdConfig(cmd *cobra.Command) *serverCmdConfig {
 	fs.Int64Var(&cfg.s3CacherOpts.partSize, "cacher-s3-part-size", 100<<20, "multipart upload part size for the S3 cacher")
 	fs.StringVar(&cfg.tempDir, "temp-dir", os.TempDir(), "directory for storing temporary files")
 	fs.BoolVar(&cfg.insecure, "insecure", false, "allow insecure TLS connections")
+	fs.StringVar(&cfg.proxy, "proxy", "", "upstream proxy URL for outgoing connections (e.g. http://host:8080, https://host:8080, socks5://host:1080, socks5://user:pass@host:1080)")
 	fs.DurationVar(&cfg.connectTimeout, "connect-timeout", 30*time.Second, "maximum amount of time (0 means no limit) will wait for an outgoing connection to establish")
 	fs.DurationVar(&cfg.fetchTimeout, "fetch-timeout", 10*time.Minute, "maximum amount of time (0 means no limit) will wait for a fetch to complete")
 	fs.DurationVar(&cfg.shutdownTimeout, "shutdown-timeout", 10*time.Second, "maximum amount of time (0 means no limit) will wait for the server to shutdown")
@@ -97,6 +101,35 @@ func runServerCmd(cmd *cobra.Command, args []string, cfg *serverCmdConfig) error
 	transport.DialContext = (&net.Dialer{Timeout: cfg.connectTimeout, KeepAlive: 30 * time.Second}).DialContext
 	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: cfg.insecure}
 	transport.RegisterProtocol("file", http.NewFileTransport(httpDirFS{}))
+	if cfg.proxy != "" {
+		proxyURL, err := url.Parse(cfg.proxy)
+		if err != nil {
+			return fmt.Errorf("invalid --proxy: %w", err)
+		}
+		switch proxyURL.Scheme {
+		case "socks5", "socks5h":
+			var auth *proxy.Auth
+			if proxyURL.User != nil {
+				auth = &proxy.Auth{User: proxyURL.User.Username()}
+				auth.Password, _ = proxyURL.User.Password()
+			}
+			dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+			if err != nil {
+				return fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
+			}
+			if dc, ok := dialer.(proxy.ContextDialer); ok {
+				transport.DialContext = dc.DialContext
+			} else {
+				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.Dial(network, addr)
+				}
+			}
+		case "http", "https":
+			transport.Proxy = http.ProxyURL(proxyURL)
+		default:
+			return fmt.Errorf("unsupported --proxy scheme %q (supported: http, https, socks5)", proxyURL.Scheme)
+		}
+	}
 	g := &goproxy.Goproxy{
 		Fetcher: &goproxy.GoFetcher{
 			GoBin:            cfg.goBin,
